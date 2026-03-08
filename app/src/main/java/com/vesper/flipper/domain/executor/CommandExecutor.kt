@@ -497,6 +497,22 @@ class CommandExecutor @Inject constructor(
                 executeSearchResources(query, resourceType)
             }
 
+            CommandAction.BROWSE_REPO -> {
+                val repoId = command.args.repoId
+                    ?: command.args.command
+                    ?: throw IllegalArgumentException("repo_id required (e.g. 'irdb')")
+                val subPath = command.args.subPath ?: ""
+                executeBrowseRepo(repoId.trim(), subPath.trim())
+            }
+
+            CommandAction.DOWNLOAD_RESOURCE -> {
+                val downloadUrl = command.args.downloadUrl
+                    ?: throw IllegalArgumentException("download_url required")
+                val destPath = command.args.path
+                    ?: throw IllegalArgumentException("destination path required")
+                executeDownloadResource(downloadUrl.trim(), destPath.trim())
+            }
+
             CommandAction.LIST_VAULT -> {
                 val filter = command.args.filter
                 val path = command.args.path
@@ -737,10 +753,11 @@ class CommandExecutor @Inject constructor(
     }
 
     private suspend fun downloadText(url: String): String = withContext(Dispatchers.IO) {
+        val isGitHubApi = url.contains("api.github.com")
         val request = Request.Builder()
             .url(url)
             .header("User-Agent", USER_AGENT)
-            .header("Accept", "text/html,application/xhtml+xml")
+            .header("Accept", if (isGitHubApi) "application/vnd.github.v3+json" else "text/html,application/xhtml+xml")
             .build()
 
         httpClient.newCall(request).execute().use { response ->
@@ -931,6 +948,161 @@ class CommandExecutor @Inject constructor(
         return CommandResultData(
             content = content,
             message = "Resource search returned ${repos.size} result(s)"
+        )
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // BROWSE REPO — list files in a GitHub repo via API
+    // ═══════════════════════════════════════════════════════
+
+    private suspend fun executeBrowseRepo(repoId: String, subPath: String): CommandResultData {
+        val repo = FlipperResourceLibrary.repositories.firstOrNull {
+            it.id.equals(repoId, ignoreCase = true) ||
+            it.name.equals(repoId, ignoreCase = true)
+        } ?: throw IllegalArgumentException(
+            "Unknown repo \"$repoId\". Use search_resources first to find available repos. " +
+            "Valid IDs: ${FlipperResourceLibrary.repositories.joinToString { it.id }}"
+        )
+
+        // Parse GitHub owner/repo from URL
+        val ghPath = repo.repoUrl.removePrefix("https://github.com/").trimEnd('/')
+        val parts = ghPath.split("/")
+        if (parts.size < 2) throw IllegalArgumentException("Invalid GitHub URL in repo: ${repo.repoUrl}")
+        val owner = parts[0]
+        val repoName = parts[1]
+
+        val apiPath = if (subPath.isNotEmpty()) {
+            "https://api.github.com/repos/$owner/$repoName/contents/$subPath"
+        } else {
+            "https://api.github.com/repos/$owner/$repoName/contents"
+        }
+
+        val json = downloadText(apiPath)
+
+        // Parse GitHub API JSON response (array of file entries)
+        val content = buildString {
+            appendLine("Repository: ${repo.name} by ${repo.author}")
+            appendLine("Path: /${subPath.ifEmpty { "(root)" }}")
+            appendLine("Flipper target: ${repo.resourceType.flipperDir}")
+            appendLine("---")
+
+            // Simple JSON array parsing for GitHub Contents API
+            val entries = parseGitHubContentsJson(json)
+            if (entries.isEmpty()) {
+                appendLine("(empty directory or API rate limit reached)")
+            } else {
+                val dirs = entries.filter { it.type == "dir" }.sortedBy { it.name }
+                val files = entries.filter { it.type == "file" }.sortedBy { it.name }
+
+                if (dirs.isNotEmpty()) {
+                    appendLine("Directories (${dirs.size}):")
+                    dirs.take(50).forEach { entry ->
+                        appendLine("  📁 ${entry.name}/")
+                    }
+                    if (dirs.size > 50) appendLine("  ... ${dirs.size - 50} more directories")
+                }
+                if (files.isNotEmpty()) {
+                    appendLine("Files (${files.size}):")
+                    files.take(80).forEach { entry ->
+                        val sizeStr = if (entry.size > 0) " (${entry.size} bytes)" else ""
+                        appendLine("  📄 ${entry.name}$sizeStr")
+                        if (entry.downloadUrl.isNotEmpty()) {
+                            appendLine("     download_url: ${entry.downloadUrl}")
+                        }
+                    }
+                    if (files.size > 80) appendLine("  ... ${files.size - 80} more files")
+                }
+            }
+        }.trim()
+
+        return CommandResultData(
+            content = content,
+            message = "Browsed ${repo.name}/${subPath.ifEmpty { "root" }}"
+        )
+    }
+
+    private data class GitHubEntry(
+        val name: String,
+        val type: String,
+        val size: Long,
+        val downloadUrl: String,
+        val path: String
+    )
+
+    private fun parseGitHubContentsJson(json: String): List<GitHubEntry> {
+        val entries = mutableListOf<GitHubEntry>()
+        try {
+            // The GitHub Contents API returns a JSON array of objects.
+            // Parse using kotlinx.serialization JsonElement.
+            val element = kotlinx.serialization.json.Json { ignoreUnknownKeys = true }
+                .parseToJsonElement(json)
+
+            val array = when (element) {
+                is kotlinx.serialization.json.JsonArray -> element
+                is kotlinx.serialization.json.JsonObject -> {
+                    // Single file response — wrap in array
+                    kotlinx.serialization.json.JsonArray(listOf(element))
+                }
+                else -> return entries
+            }
+
+            for (item in array) {
+                if (item !is kotlinx.serialization.json.JsonObject) continue
+                val name = item["name"]?.let {
+                    (it as? kotlinx.serialization.json.JsonPrimitive)?.content
+                } ?: continue
+                val type = item["type"]?.let {
+                    (it as? kotlinx.serialization.json.JsonPrimitive)?.content
+                } ?: "file"
+                val size = item["size"]?.let {
+                    (it as? kotlinx.serialization.json.JsonPrimitive)?.content?.toLongOrNull()
+                } ?: 0L
+                val downloadUrl = item["download_url"]?.let {
+                    if (it is kotlinx.serialization.json.JsonNull) null
+                    else (it as? kotlinx.serialization.json.JsonPrimitive)?.content
+                } ?: ""
+                val path = item["path"]?.let {
+                    (it as? kotlinx.serialization.json.JsonPrimitive)?.content
+                } ?: name
+
+                entries.add(GitHubEntry(name, type, size, downloadUrl, path))
+            }
+        } catch (_: Exception) {
+            // If JSON parsing fails, return empty
+        }
+        return entries
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // DOWNLOAD RESOURCE — fetch a file from a URL and write to Flipper
+    // ═══════════════════════════════════════════════════════
+
+    private suspend fun executeDownloadResource(url: String, destPath: String): CommandResultData {
+        if (!url.startsWith("https://", ignoreCase = true) && !url.startsWith("http://", ignoreCase = true)) {
+            throw IllegalArgumentException("download_url must be a valid HTTP(S) URL")
+        }
+
+        // Ensure parent directory exists
+        val parentDir = destPath.substringBeforeLast("/")
+        if (parentDir.isNotEmpty() && parentDir != destPath) {
+            ensureDirectoryExists(parentDir)
+        }
+
+        val download = downloadBinary(url)
+        if (download.bytes.isEmpty()) {
+            throw IOException("Downloaded file is empty")
+        }
+        if (download.bytes.size > MAX_FAP_BYTES) {
+            throw IOException("Downloaded file too large (${download.bytes.size} bytes, max ${MAX_FAP_BYTES})")
+        }
+
+        val bytesWritten = fileSystem.writeFileBytes(destPath, download.bytes).getOrThrow()
+        val fileName = destPath.substringAfterLast("/")
+
+        return CommandResultData(
+            bytesWritten = bytesWritten,
+            content = "downloaded=$fileName\nsource_url=$url\ntarget_path=$destPath\nsize=${download.bytes.size} bytes",
+            message = "Downloaded $fileName to $destPath (${download.bytes.size} bytes)"
         )
     }
 

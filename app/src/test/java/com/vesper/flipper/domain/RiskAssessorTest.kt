@@ -101,6 +101,39 @@ class RiskAssessorTest {
         assertFalse(assessment.requiresConfirmation)
     }
 
+    @Test
+    fun `browse repo is LOW risk`() {
+        val command = ExecuteCommand(
+            action = CommandAction.BROWSE_REPO,
+            args = CommandArgs(repoId = "irdb", subPath = "TVs/Samsung"),
+            justification = "Browse IR remote database",
+            expectedEffect = "List files in IRDB Samsung TVs directory"
+        )
+
+        val assessment = riskAssessor.assess(command)
+
+        assertEquals(RiskLevel.LOW, assessment.level)
+        assertFalse(assessment.requiresConfirmation)
+    }
+
+    @Test
+    fun `download resource is MEDIUM risk`() {
+        val command = ExecuteCommand(
+            action = CommandAction.DOWNLOAD_RESOURCE,
+            args = CommandArgs(
+                downloadUrl = "https://raw.githubusercontent.com/example/test.ir",
+                path = "/ext/infrared/test.ir"
+            ),
+            justification = "Download IR remote file",
+            expectedEffect = "Save IR file to Flipper storage"
+        )
+
+        val assessment = riskAssessor.assess(command)
+
+        assertEquals(RiskLevel.MEDIUM, assessment.level)
+        assertTrue(assessment.requiresConfirmation)
+    }
+
     // ============================================
     // MEDIUM Risk Operations (Diff + Apply)
     // ============================================

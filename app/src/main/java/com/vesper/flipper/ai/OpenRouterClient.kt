@@ -642,6 +642,8 @@ class OpenRouterClient @Inject constructor(
                 CommandAction.EXECUTE_CLI
             "forge_payload", "forge", "craft_payload", "create_payload" -> CommandAction.FORGE_PAYLOAD
             "search_resources", "browse_resources", "find_resources" -> CommandAction.SEARCH_RESOURCES
+            "browse_repo", "browse_repository", "list_repo", "repo_browse", "repo_contents" -> CommandAction.BROWSE_REPO
+            "download_resource", "download_file", "fetch_resource", "get_resource" -> CommandAction.DOWNLOAD_RESOURCE
             "list_vault", "vault", "scan_vault", "inventory" -> CommandAction.LIST_VAULT
             "run_runbook", "runbook", "diagnostic" -> CommandAction.RUN_RUNBOOK
             "launch_app", "open_app", "start_app", "loader_open" -> CommandAction.LAUNCH_APP

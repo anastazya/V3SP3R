@@ -102,7 +102,13 @@ enum class CommandAction {
     LED_CONTROL,
 
     @SerialName("vibro_control")
-    VIBRO_CONTROL
+    VIBRO_CONTROL,
+
+    @SerialName("browse_repo")
+    BROWSE_REPO,
+
+    @SerialName("download_resource")
+    DOWNLOAD_RESOURCE
 }
 
 @Serializable
@@ -141,7 +147,13 @@ data class CommandArgs(
     val enabled: Boolean? = null,
     val red: Int? = null,
     val green: Int? = null,
-    val blue: Int? = null
+    val blue: Int? = null,
+    @SerialName("repo_id")
+    val repoId: String? = null,
+    @SerialName("sub_path")
+    val subPath: String? = null,
+    @SerialName("download_url")
+    val downloadUrl: String? = null
 )
 
 /**
