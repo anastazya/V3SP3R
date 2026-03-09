@@ -5,6 +5,9 @@ import com.vesper.flipper.domain.model.*
 import com.vesper.flipper.security.InputValidator
 import com.vesper.flipper.security.RateLimiter
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
@@ -88,9 +91,21 @@ class OpenRouterClient @Inject constructor(
         val model = settingsStore.selectedModel.first()
 
         val compactMessages = trimConversationForRequest(messages)
+
+        val hasImages = compactMessages.any { !it.imageAttachments.isNullOrEmpty() }
+
+        // If images are present, use a vision model to describe them first,
+        // then send the descriptions as text to the primary model (Hermes).
+        // This lets us keep using tool-capable models that don't support images.
+        val processedMessages = if (hasImages) {
+            preprocessImagesAsText(compactMessages, apiKey)
+        } else {
+            compactMessages
+        }
+
         val requestMessages = buildList {
             add(OpenRouterMessage.text(role = "system", content = systemPrompt))
-            addAll(sanitizeAndBuildRequestMessages(compactMessages))
+            addAll(sanitizeAndBuildRequestMessages(processedMessages))
         }
 
         val candidateModels = buildToolModelCandidates(model)
@@ -154,6 +169,115 @@ class OpenRouterClient @Inject constructor(
         }
 
         lastError ?: ChatCompletionResult.Error("Unable to find a working model for tool execution.")
+    }
+
+    /**
+     * Pre-process messages that contain images by sending each image to a fast
+     * vision model (Gemini Flash) for description, then replacing the image
+     * attachments with the text description. This allows the primary model
+     * (which may not support images) to understand what the user photographed.
+     */
+    private suspend fun preprocessImagesAsText(
+        messages: List<ChatMessage>,
+        apiKey: String
+    ): List<ChatMessage> = coroutineScope {
+        messages.map { msg ->
+            if (msg.imageAttachments.isNullOrEmpty()) return@map msg
+
+            // Process all images in parallel for faster response
+            val results = msg.imageAttachments.map { attachment ->
+                async { describeImage(apiKey, attachment) }
+            }.awaitAll()
+            val descriptions = results.filterNotNull()
+            val failedCount = results.size - descriptions.size
+
+            if (descriptions.isEmpty()) {
+                // All image descriptions failed — let the model know images were attached
+                val failNote = "[${msg.imageAttachments.size} image(s) were attached but could not be analyzed. " +
+                    "Ask the user to try again or describe what they see.]"
+                val fallbackContent = if (msg.content.isNotBlank()) {
+                    "$failNote\n\n${msg.content}"
+                } else {
+                    failNote
+                }
+                return@map msg.copy(content = fallbackContent, imageAttachments = null)
+            }
+
+            val imageContext = buildString {
+                descriptions.forEach { desc -> appendLine("[Attached image: $desc]") }
+                if (failedCount > 0) {
+                    appendLine("[$failedCount additional image(s) could not be analyzed]")
+                }
+            }.trim()
+            val updatedContent = if (msg.content.isNotBlank()) {
+                "$imageContext\n\n${msg.content}"
+            } else {
+                imageContext
+            }
+
+            msg.copy(content = updatedContent, imageAttachments = null)
+        }
+    }
+
+    /**
+     * Send a single image to a fast vision model and get a detailed description.
+     * Uses Gemini Flash — cheap, fast, excellent at visual identification.
+     */
+    private suspend fun describeImage(
+        apiKey: String,
+        attachment: ImageAttachment
+    ): String? {
+        return try {
+            val visionMessages = listOf(
+                OpenRouterMessage.text(
+                    role = "system",
+                    content = "You are a visual analysis assistant for a Flipper Zero companion app. " +
+                        "Describe what you see in the image in detail. Focus on: brand names, model numbers, " +
+                        "device types (TV, AC, car, remote control, etc.), any visible text or labels, " +
+                        "and any details that would help identify the correct IR/RF protocol or signal. " +
+                        "Be specific and concise."
+                ),
+                OpenRouterMessage.multimodal(
+                    role = "user",
+                    text = "Describe this image in detail. What device, brand, model, or item is shown?",
+                    images = listOf(
+                        ImageContent(
+                            base64Data = attachment.base64Data,
+                            mimeType = attachment.mimeType,
+                            detail = "high"
+                        )
+                    )
+                )
+            )
+
+            val request = OpenRouterRequest(
+                model = VISION_PREPROCESSING_MODEL,
+                messages = visionMessages,
+                tools = null,
+                toolChoice = null,
+                maxTokens = 300
+            )
+
+            val requestBody = json.encodeToString(request)
+                .toRequestBody("application/json".toMediaType())
+
+            val httpRequest = Request.Builder()
+                .url(OPENROUTER_API_URL)
+                .addHeader("Authorization", "Bearer $apiKey")
+                .addHeader("Content-Type", "application/json")
+                .addHeader("HTTP-Referer", "https://vesper.flipper.app")
+                .addHeader("X-Title", "Vesper Flipper Control")
+                .post(requestBody)
+                .build()
+
+            val result = executeWithRetry(httpRequest)
+            when (result) {
+                is ChatCompletionResult.Success -> result.content.takeIf { it.isNotBlank() }
+                is ChatCompletionResult.Error -> null
+            }
+        } catch (_: Exception) {
+            null
+        }
     }
 
     /**
@@ -1042,6 +1166,10 @@ class OpenRouterClient @Inject constructor(
         private val KNOWN_NON_TOOL_MODELS = setOf(
             "google/gemini-2.5-flash-image-preview"
         )
+
+        // Fast, cheap vision model used to describe images before sending to the
+        // primary tool model. Gemini Flash is ideal: fast, supports images, low cost.
+        private const val VISION_PREPROCESSING_MODEL = "google/gemini-2.0-flash-001"
 
         private val EXECUTE_COMMAND_TOOL = OpenRouterTool(
             type = "function",
