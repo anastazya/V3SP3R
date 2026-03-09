@@ -93,7 +93,8 @@ class OpenRouterClient @Inject constructor(
             addAll(sanitizeAndBuildRequestMessages(compactMessages))
         }
 
-        val candidateModels = buildToolModelCandidates(model)
+        val hasImages = messages.any { !it.imageAttachments.isNullOrEmpty() }
+        val candidateModels = buildToolModelCandidates(model, hasImages)
         var lastError: ChatCompletionResult.Error? = null
         val attemptedModels = mutableListOf<String>()
         val unsupportedModels = mutableListOf<String>()
@@ -131,6 +132,11 @@ class OpenRouterClient @Inject constructor(
 
                     if (isToolUseUnsupportedError(result.message)) {
                         markToolModelUnsupported(candidateModel)
+                        unsupportedModels.add(candidateModel)
+                        continue
+                    }
+
+                    if (hasImages && isImageUnsupportedError(result.message)) {
                         unsupportedModels.add(candidateModel)
                         continue
                     }
@@ -952,9 +958,18 @@ class OpenRouterClient @Inject constructor(
                 normalized.contains("access denied")
     }
 
-    private fun buildToolModelCandidates(selectedModel: String): List<String> {
+    private fun isImageUnsupportedError(message: String): Boolean {
+        val normalized = message.lowercase()
+        return normalized.contains("no endpoints found") && normalized.contains("image") ||
+                normalized.contains("does not support image") ||
+                normalized.contains("does not support vision") ||
+                normalized.contains("multimodal") && normalized.contains("not supported") ||
+                normalized.contains("image_url") && (normalized.contains("not supported") || normalized.contains("no endpoints"))
+    }
+
+    private fun buildToolModelCandidates(selectedModel: String, hasImages: Boolean = false): List<String> {
         val fallbackModels = TOOL_USE_FALLBACK_MODELS + SettingsStore.FALLBACK_MODELS.map { it.id }
-        return (listOf(selectedModel) + fallbackModels)
+        val candidates = (listOf(selectedModel) + fallbackModels)
             .map { it.trim() }
             .filter { it.isNotBlank() }
             .filterNot { modelId ->
@@ -963,7 +978,17 @@ class OpenRouterClient @Inject constructor(
                 }
             }
             .distinct()
-            .take(MAX_TOOL_MODEL_CANDIDATES)
+
+        if (!hasImages) return candidates.take(MAX_TOOL_MODEL_CANDIDATES)
+
+        // When images are present, prioritize vision-capable models
+        val visionModels = candidates.filter { modelId ->
+            VISION_CAPABLE_MODELS.any { vision ->
+                modelId.equals(vision, ignoreCase = true)
+            }
+        }
+        val nonVisionModels = candidates - visionModels.toSet()
+        return (visionModels + nonVisionModels).take(MAX_TOOL_MODEL_CANDIDATES)
     }
 
     private fun isToolModelTemporarilyBlocked(model: String): Boolean {
@@ -1041,6 +1066,18 @@ class OpenRouterClient @Inject constructor(
 
         private val KNOWN_NON_TOOL_MODELS = setOf(
             "google/gemini-2.5-flash-image-preview"
+        )
+
+        // Models that support both vision (image input) AND tool use on OpenRouter
+        private val VISION_CAPABLE_MODELS = listOf(
+            "anthropic/claude-sonnet-4.5",
+            "openai/gpt-4o",
+            "openai/gpt-4o-mini",
+            "google/gemini-2.5-flash-preview",
+            "google/gemini-2.5-pro-preview",
+            "x-ai/grok-4-fast",
+            "meta-llama/llama-4-maverick",
+            "anthropic/claude-haiku-3.5"
         )
 
         private val EXECUTE_COMMAND_TOOL = OpenRouterTool(
