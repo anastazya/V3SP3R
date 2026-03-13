@@ -23,6 +23,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -66,12 +67,25 @@ fun ChatScreen(
     val inputText by viewModel.inputText.collectAsState()
     val pendingImages by viewModel.pendingImages.collectAsState()
     val isProcessingImage by viewModel.isProcessingImage.collectAsState()
+    val imageError by viewModel.imageError.collectAsState()
+    val glassesBridgeState by viewModel.glassesBridgeState.collectAsState()
+    val glassesMuted by viewModel.glassesMuted.collectAsState()
+    val isGlassesConnected = glassesBridgeState is com.vesper.flipper.glasses.BridgeState.Connected
     val sessionHistory by viewModel.sessionHistory.collectAsState()
     val listState = rememberLazyListState()
     val coroutineScope = rememberCoroutineScope()
+    val snackbarHostState = remember { SnackbarHostState() }
     var showDeleteConfirmation by remember { mutableStateOf(false) }
     var showHistoryDrawer by remember { mutableStateOf(false) }
     var showAttachMenu by remember { mutableStateOf(false) }
+
+    // Show snackbar when image processing fails
+    LaunchedEffect(imageError) {
+        imageError?.let {
+            snackbarHostState.showSnackbar(it)
+            viewModel.clearImageError()
+        }
+    }
 
     // Photo picker launcher
     val photoPickerLauncher = rememberLauncherForActivityResult(
@@ -87,23 +101,34 @@ fun ChatScreen(
         uris.forEach { viewModel.addImage(it) }
     }
 
-    // Camera capture: create a temp file URI for the camera to write to
+    // Camera capture: create a temp file URI for the camera to write to.
+    // Use rememberSaveable so the URI survives activity recreation (Android
+    // may kill the activity while the camera app is in the foreground).
     val context = LocalContext.current
-    var cameraImageUri by remember { mutableStateOf<Uri?>(null) }
+    var cameraImageUriString by rememberSaveable { mutableStateOf<String?>(null) }
 
     val cameraLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.TakePicture()
     ) { success ->
-        if (success) {
-            cameraImageUri?.let { viewModel.addImage(it) }
+        val uri = cameraImageUriString?.let { Uri.parse(it) }
+        if (success && uri != null) {
+            viewModel.addImage(uri)
+        } else if (uri != null) {
+            // Some camera apps return false even when the photo was saved.
+            // Check if the file actually exists before giving up.
+            val exists = try {
+                context.contentResolver.openInputStream(uri)?.use { it.available() > 0 } == true
+            } catch (_: Exception) { false }
+            if (exists) viewModel.addImage(uri)
         }
     }
 
     val videoLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CaptureVideo()
     ) { success ->
-        if (success) {
-            cameraImageUri?.let { viewModel.addImage(it) }
+        val uri = cameraImageUriString?.let { Uri.parse(it) }
+        if (success && uri != null) {
+            viewModel.addImage(uri)
         }
     }
 
@@ -113,7 +138,7 @@ fun ChatScreen(
     ) { granted ->
         if (granted) {
             val uri = createCameraCaptureUri(context)
-            cameraImageUri = uri
+            cameraImageUriString = uri.toString()
             cameraLauncher.launch(uri)
         }
     }
@@ -123,7 +148,7 @@ fun ChatScreen(
     ) { granted ->
         if (granted) {
             val uri = createCameraCaptureUri(context, video = true)
-            cameraImageUri = uri
+            cameraImageUriString = uri.toString()
             videoLauncher.launch(uri)
         }
     }
@@ -215,6 +240,7 @@ fun ChatScreen(
     }
 
     Scaffold(
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
             TopAppBar(
                 navigationIcon = {
@@ -307,7 +333,10 @@ fun ChatScreen(
                 isProcessingImage = isProcessingImage,
                 voiceState = voiceState,
                 voicePartialResult = voicePartialResult,
-                enabled = !conversationState.isLoading && conversationState.pendingApproval == null
+                enabled = !conversationState.isLoading && conversationState.pendingApproval == null,
+                isGlassesConnected = isGlassesConnected,
+                isGlassesMuted = glassesMuted,
+                onToggleGlassesMute = { viewModel.toggleGlassesMute() }
             )
         }
     ) { padding ->
@@ -829,7 +858,10 @@ private fun ChatInputBar(
     isProcessingImage: Boolean,
     voiceState: SpeechState,
     voicePartialResult: String,
-    enabled: Boolean
+    enabled: Boolean,
+    isGlassesConnected: Boolean = false,
+    isGlassesMuted: Boolean = false,
+    onToggleGlassesMute: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val hasContent = value.isNotBlank() || pendingImages.isNotEmpty()
@@ -926,29 +958,42 @@ private fun ChatInputBar(
                     }
                 }
 
-                // Voice input button
-                IconButton(
-                    onClick = {
-                        if (isListening) {
-                            onStopVoice()
-                        } else {
-                            onVoiceInput()
-                        }
-                    },
-                    enabled = enabled && !isProcessingImage
-                ) {
-                    if (isProcessingVoice) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(20.dp),
-                            color = VesperOrange,
-                            strokeWidth = 2.dp
-                        )
-                    } else {
+                // Mic button: glasses mute toggle when connected, voice input otherwise
+                if (isGlassesConnected) {
+                    IconButton(
+                        onClick = onToggleGlassesMute,
+                        enabled = enabled
+                    ) {
                         Icon(
-                            if (isListening) Icons.Default.Stop else Icons.Default.Mic,
-                            contentDescription = if (isListening) "Stop listening" else "Voice input",
-                            tint = VesperOrange
+                            if (isGlassesMuted) Icons.Default.MicOff else Icons.Default.Mic,
+                            contentDescription = if (isGlassesMuted) "Unmute glasses mic" else "Mute glasses mic",
+                            tint = if (isGlassesMuted) MaterialTheme.colorScheme.error else VesperOrange
                         )
+                    }
+                } else {
+                    IconButton(
+                        onClick = {
+                            if (isListening) {
+                                onStopVoice()
+                            } else {
+                                onVoiceInput()
+                            }
+                        },
+                        enabled = enabled && !isProcessingImage
+                    ) {
+                        if (isProcessingVoice) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(20.dp),
+                                color = VesperOrange,
+                                strokeWidth = 2.dp
+                            )
+                        } else {
+                            Icon(
+                                if (isListening) Icons.Default.Stop else Icons.Default.Mic,
+                                contentDescription = if (isListening) "Stop listening" else "Voice input",
+                                tint = VesperOrange
+                            )
+                        }
                     }
                 }
 
