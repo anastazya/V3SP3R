@@ -291,7 +291,7 @@ PRs welcome. Areas that need love:
 
 ## License
 
-MIT License — see [LICENSE](LICENSE).
+AGPL 3.0 License — see [LICENSE](LICENSE).
 
 ---
 
