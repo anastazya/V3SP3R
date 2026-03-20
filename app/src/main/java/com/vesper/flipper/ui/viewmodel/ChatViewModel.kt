@@ -509,6 +509,17 @@ class ChatViewModel @Inject constructor(
         }
     }
 
+    fun retryLastMessage() {
+        viewModelScope.launch {
+            try {
+                vesperAgent.retryLastMessage()
+            } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                Log.e(TAG, "retryLastMessage failed", e)
+            }
+        }
+    }
+
     fun approveAction(approvalId: String? = null) {
         if (approvalDecisionInFlight) return
         val targetApprovalId = approvalId ?: conversationState.value.pendingApproval?.id ?: return

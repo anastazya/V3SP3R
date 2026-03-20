@@ -361,11 +361,16 @@ fun ChatScreen(
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     items(conversationState.messages) { message ->
+                        val isLastMessage = message == conversationState.messages.lastOrNull()
                         ChatMessageItem(
                             message = message,
                             ttsState = ttsState,
                             onSpeak = { viewModel.speakText(it) },
-                            onStopSpeaking = { viewModel.stopSpeaking() }
+                            onStopSpeaking = { viewModel.stopSpeaking() },
+                            showRetry = isLastMessage && !conversationState.isLoading &&
+                                    conversationState.error != null &&
+                                    message.role == MessageRole.ASSISTANT,
+                            onRetry = { viewModel.retryLastMessage() }
                         )
                     }
 
@@ -377,13 +382,20 @@ fun ChatScreen(
                 }
             }
 
-            // Error snackbar
+            // Error snackbar with retry
             conversationState.error?.let { error ->
                 Snackbar(
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .padding(16.dp),
-                    containerColor = RiskHigh
+                    containerColor = RiskHigh,
+                    action = {
+                        TextButton(
+                            onClick = { viewModel.retryLastMessage() }
+                        ) {
+                            Text("Retry", color = Color.White)
+                        }
+                    }
                 ) {
                     Text(error)
                 }
@@ -487,7 +499,9 @@ private fun ChatMessageItem(
     message: ChatMessage,
     ttsState: TtsState = TtsState.Idle,
     onSpeak: ((String) -> Unit)? = null,
-    onStopSpeaking: (() -> Unit)? = null
+    onStopSpeaking: (() -> Unit)? = null,
+    showRetry: Boolean = false,
+    onRetry: (() -> Unit)? = null
 ) {
     val isUser = message.role == MessageRole.USER
     val isAssistant = message.role == MessageRole.ASSISTANT
@@ -676,6 +690,35 @@ private fun ChatMessageItem(
                                 )
                             }
                         }
+                    }
+                }
+            }
+
+            // Retry button for failed responses
+            if (showRetry && onRetry != null) {
+                Surface(
+                    onClick = onRetry,
+                    modifier = Modifier.padding(top = 6.dp),
+                    shape = RoundedCornerShape(16.dp),
+                    color = RiskHigh.copy(alpha = 0.12f),
+                    border = BorderStroke(0.5.dp, RiskHigh.copy(alpha = 0.3f))
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Refresh,
+                            contentDescription = null,
+                            modifier = Modifier.size(14.dp),
+                            tint = RiskHigh
+                        )
+                        Text(
+                            "Retry",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = RiskHigh
+                        )
                     }
                 }
             }

@@ -131,6 +131,48 @@ class VesperAgent @Inject constructor(
     }
 
     /**
+     * Retry the last AI request by re-submitting the current conversation
+     * (minus any trailing error/incomplete assistant messages) back to the model.
+     */
+    suspend fun retryLastMessage(): ConversationState {
+        val current = _conversationState.value
+        if (current.isLoading) return current
+
+        // Strip trailing assistant/tool messages that represent the failed attempt
+        val messages = current.messages.toMutableList()
+        while (messages.isNotEmpty()) {
+            val last = messages.last()
+            if (last.role == MessageRole.USER) break
+            messages.removeAt(messages.size - 1)
+        }
+
+        if (messages.isEmpty()) return current
+
+        _conversationState.value = current.copy(
+            messages = messages,
+            isLoading = true,
+            progress = AgentProgress(
+                stage = AgentProgressStage.MODEL_REQUEST,
+                detail = "Retrying..."
+            ),
+            error = null
+        )
+
+        return try {
+            processAIResponse(messages)
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            _conversationState.value = _conversationState.value.copy(
+                messages = messages,
+                isLoading = false,
+                progress = null,
+                error = "Retry failed: ${e.message?.take(120) ?: "unknown error"}"
+            )
+            _conversationState.value
+        }
+    }
+
+    /**
      * Continue after tool approval/rejection
      */
     suspend fun continueAfterApproval(approvalId: String, approved: Boolean): ConversationState {

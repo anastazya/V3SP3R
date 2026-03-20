@@ -745,9 +745,12 @@ class OpenRouterClient @Inject constructor(
             return ParsedCommand(command = json.decodeFromString<ExecuteCommand>(trimmedArguments))
         }
 
+        // Attempt to repair common JSON malformations from LLMs before fallback parsing.
+        val repairedArguments = repairMalformedJson(trimmedArguments)
+
         // Fallback: tolerate missing non-critical fields and args shape variations.
         return runCatching {
-            val rawElement = json.parseToJsonElement(trimmedArguments)
+            val rawElement = json.parseToJsonElement(repairedArguments)
 
             // Unwrap single-element JSON arrays — some models wrap args in [{...}].
             val rootElement = when {
@@ -963,6 +966,82 @@ class OpenRouterClient @Inject constructor(
             element is JsonPrimitive -> "primitive"
             else -> "unknown"
         }
+    }
+
+    /**
+     * Attempt to repair common JSON malformations produced by LLMs.
+     * Handles: trailing commas, unclosed strings/braces/brackets, and
+     * markdown code fences wrapping JSON.
+     */
+    private fun repairMalformedJson(input: String): String {
+        var s = input.trim()
+
+        // Strip markdown code fences: ```json ... ``` or ``` ... ```
+        if (s.startsWith("```")) {
+            val firstNewline = s.indexOf('\n')
+            if (firstNewline > 0) {
+                s = s.substring(firstNewline + 1)
+            }
+            if (s.endsWith("```")) {
+                s = s.dropLast(3).trimEnd()
+            }
+        }
+
+        // Remove trailing commas before } or ] (a very common LLM mistake)
+        s = s.replace(Regex(",\\s*}"), "}")
+        s = s.replace(Regex(",\\s*]"), "]")
+
+        // If JSON already parses cleanly after comma repair, return early.
+        runCatching { json.parseToJsonElement(s) }.onSuccess { return s }
+
+        // Attempt to close unclosed strings, braces, and brackets.
+        // Walk the string to figure out what's still open.
+        var inString = false
+        var escaped = false
+        val stack = mutableListOf<Char>() // tracks open { and [
+        var lastNonWs = ' '
+
+        for (ch in s) {
+            if (inString) {
+                if (escaped) {
+                    escaped = false
+                } else when (ch) {
+                    '\\' -> escaped = true
+                    '"' -> inString = false
+                }
+            } else {
+                when (ch) {
+                    '"' -> inString = true
+                    '{' -> stack.add('{')
+                    '[' -> stack.add('[')
+                    '}' -> if (stack.lastOrNull() == '{') stack.removeLastOrNull()
+                    ']' -> if (stack.lastOrNull() == '[') stack.removeLastOrNull()
+                }
+            }
+            if (!ch.isWhitespace()) lastNonWs = ch
+        }
+
+        val sb = StringBuilder(s)
+
+        // Close an unterminated string
+        if (inString) sb.append('"')
+
+        // Remove a dangling comma before we close brackets
+        val trimmedEnd = sb.toString().trimEnd()
+        if (trimmedEnd.endsWith(",")) {
+            sb.clear()
+            sb.append(trimmedEnd.dropLast(1))
+        }
+
+        // Close unclosed braces/brackets in reverse order
+        for (i in stack.indices.reversed()) {
+            when (stack[i]) {
+                '{' -> sb.append('}')
+                '[' -> sb.append(']')
+            }
+        }
+
+        return sb.toString()
     }
 
     private fun sanitizeErrorMessage(message: String?): String {
